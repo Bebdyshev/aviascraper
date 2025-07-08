@@ -3,10 +3,7 @@ import time
 import uuid
 import json
 import os
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service as ChromeService
-from webdriver_manager.chrome import ChromeDriverManager
+from playwright.sync_api import sync_playwright
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
@@ -215,7 +212,7 @@ def poll_results(search_id: str, results_host: str, limit: int = 100, max_attemp
 
 def get_x_origin_cookie(force_refresh: bool = False) -> str:
     """
-    Gets cookies, from cache if available, or via Selenium if forced/needed.
+    Gets cookies, from cache if available, or via Playwright if forced/needed.
     Set force_refresh=True to ignore cache and get new cookies.
     """
     if not force_refresh and os.path.exists(COOKIES_FILE):
@@ -230,46 +227,67 @@ def get_x_origin_cookie(force_refresh: bool = False) -> str:
             print(f"Could not read cookie file, fetching new ones. Error: {e}")
             # Fall through to fetch new cookies
 
-    print("Fetching fresh cookies via Selenium (this might take a moment)...")
+    print("Fetching fresh cookies via Playwright (this might take a moment)...")
     
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")  # Часто нужно для серверов
-    options.add_argument("--disable-dev-shm-usage")  # Помогает с памятью
-    options.add_argument("--disable-gpu")  # Отключает GPU на серверах
-    options.add_argument("--remote-debugging-port=9222")  # Для отладки
-    options.add_argument("--disable-web-security")
-    options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("user-agent=Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0")
-    
-    driver = None
     try:
-        print("Installing ChromeDriver...")
-        service = ChromeService(ChromeDriverManager().install())
-        print("Starting Chrome browser...")
-        driver = webdriver.Chrome(service=service, options=options)
-        
-        print("Navigating to Aviasales...")
-        # Go to a search page to ensure all necessary cookies are set
-        driver.get("https://www.aviasales.kz/search/NQZ0108AKX15081")
-        # A small wait can help with cookies set by JS after load
-        time.sleep(3)
-
-        print("Extracting cookies...")
-        cookies = driver.get_cookies()
-        
-        print(f"Found {len(cookies)} cookies")
-        if not cookies:
-            raise Exception("No cookies found")
+        with sync_playwright() as p:
+            print("Starting browser...")
+            # Запускаем Chromium в headless режиме
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage", 
+                    "--disable-gpu",
+                    "--disable-web-security",
+                    "--disable-features=VizDisplayCompositor"
+                ]
+            )
             
-        with open(COOKIES_FILE, "w") as f:
-            json.dump(cookies, f)
-        print("Successfully fetched and cached new cookies.")
+            print("Creating browser context...")
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0",
+                viewport={"width": 1920, "height": 1080}
+            )
+            
+            print("Opening new page...")
+            page = context.new_page()
+            
+            print("Navigating to Aviasales...")
+            # Go to a search page to ensure all necessary cookies are set
+            page.goto("https://www.aviasales.kz/search/NQZ0108AKX15081", wait_until="networkidle")
+            
+            # Small wait for JS to set cookies
+            page.wait_for_timeout(3000)
 
-        return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            print("Extracting cookies...")
+            cookies_playwright = context.cookies()
+            
+            print(f"Found {len(cookies_playwright)} cookies")
+            if not cookies_playwright:
+                raise Exception("No cookies found")
+            
+            # Преобразуем формат кук из Playwright в формат Selenium для совместимости
+            cookies_selenium_format = []
+            for cookie in cookies_playwright:
+                cookies_selenium_format.append({
+                    "name": cookie["name"],
+                    "value": cookie["value"],
+                    "domain": cookie["domain"],
+                    "path": cookie["path"],
+                    "secure": cookie["secure"],
+                    "httpOnly": cookie["httpOnly"]
+                })
+            
+            with open(COOKIES_FILE, "w") as f:
+                json.dump(cookies_selenium_format, f)
+            print("Successfully fetched and cached new cookies.")
+
+            browser.close()
+            return "; ".join([f"{c['name']}={c['value']}" for c in cookies_selenium_format])
         
     except Exception as e:
-        error_msg = f"Selenium failed: {type(e).__name__}: {str(e)}"
+        error_msg = f"Playwright failed: {type(e).__name__}: {str(e)}"
         print(f"ERROR: {error_msg}")
         
         # Fallback: попробуем использовать статические куки или вернуть пустую строку
@@ -282,12 +300,6 @@ def get_x_origin_cookie(force_refresh: bool = False) -> str:
             print("No fallback cookies available")
             # Возвращаем пустую строку вместо краха приложения
             return ""
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception as e:
-                print(f"Error closing driver: {e}")
 
 
 def extract_waf_token_from_cookies(cookie_string: str) -> str:
