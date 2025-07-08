@@ -234,28 +234,71 @@ def get_x_origin_cookie(force_refresh: bool = False) -> str:
     
     options = Options()
     options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")  # Часто нужно для серверов
+    options.add_argument("--disable-dev-shm-usage")  # Помогает с памятью
+    options.add_argument("--disable-gpu")  # Отключает GPU на серверах
+    options.add_argument("--remote-debugging-port=9222")  # Для отладки
+    options.add_argument("--disable-web-security")
+    options.add_argument("--disable-features=VizDisplayCompositor")
     options.add_argument("user-agent=Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0")
     
     driver = None
     try:
+        print("Installing ChromeDriver...")
         service = ChromeService(ChromeDriverManager().install())
+        print("Starting Chrome browser...")
         driver = webdriver.Chrome(service=service, options=options)
         
+        print("Navigating to Aviasales...")
         # Go to a search page to ensure all necessary cookies are set
         driver.get("https://www.aviasales.kz/search/NQZ0108AKX15081")
         # A small wait can help with cookies set by JS after load
         time.sleep(3)
 
+        print("Extracting cookies...")
         cookies = driver.get_cookies()
+        
+        print(f"Found {len(cookies)} cookies")
+        if not cookies:
+            raise Exception("No cookies found")
+            
         with open(COOKIES_FILE, "w") as f:
             json.dump(cookies, f)
         print("Successfully fetched and cached new cookies.")
 
         return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        
+    except Exception as e:
+        error_msg = f"Selenium failed: {type(e).__name__}: {str(e)}"
+        print(f"ERROR: {error_msg}")
+        
+        # Fallback: попробуем использовать статические куки или вернуть пустую строку
+        print("Trying fallback approach...")
+        fallback_cookies = get_fallback_cookies()
+        if fallback_cookies:
+            print("Using fallback cookies")
+            return fallback_cookies
+        else:
+            print("No fallback cookies available")
+            # Возвращаем пустую строку вместо краха приложения
+            return ""
     finally:
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception as e:
+                print(f"Error closing driver: {e}")
 
+
+def get_fallback_cookies() -> str:
+    """
+    Возвращает заранее подготовленные куки как fallback, 
+    если Selenium не работает на сервере
+    """
+    # Можно вручную добавить некоторые базовые куки
+    # Это не идеальное решение, но лучше чем полный крах
+    fallback = "currency=KZT; marker=direct; auid=fallback"
+    return fallback
 
 def build_summary(api_response, start_payload):
     # If response is list of chunks, find the one with chunk_id == "results"
@@ -456,29 +499,64 @@ async def search_flights(request_data: SearchRequest):
     }
 
     current_headers = HEADERS.copy()
-    x_origin_cookie = get_x_origin_cookie()
-    current_headers["x-origin-cookie"] = x_origin_cookie
-
+    
     try:
+        print("Getting cookies...")
+        x_origin_cookie = get_x_origin_cookie()
+        if x_origin_cookie:
+            current_headers["x-origin-cookie"] = x_origin_cookie
+            print(f"Using cookies: {x_origin_cookie[:100]}..." if len(x_origin_cookie) > 100 else f"Using cookies: {x_origin_cookie}")
+        else:
+            print("No cookies available, trying without x-origin-cookie header")
+
         print("Starting search with current cookies...")
         sid, host, timestamp = start_search(start_payload, current_headers)
         print("search_id:", sid)
         res = poll_results(sid, host)
+        
     except requests.exceptions.HTTPError as e:
         if e.response.status_code in [401, 403]:
-            print(f"Request failed with {e.response.status_code}. Cookies might be expired. Forcing refresh...")
-            x_origin_cookie = get_x_origin_cookie(force_refresh=True)
-            current_headers["x-origin-cookie"] = x_origin_cookie
-
-            print("Retrying search with fresh cookies...")
-            sid, host, timestamp = start_search(start_payload, current_headers)
-            print("search_id:", sid)
-            res = poll_results(sid, host)
+            print(f"Request failed with {e.response.status_code}. Trying to refresh cookies...")
+            
+            try:
+                x_origin_cookie = get_x_origin_cookie(force_refresh=True)
+                if x_origin_cookie and x_origin_cookie != "currency=KZT; marker=direct; auid=fallback":
+                    current_headers["x-origin-cookie"] = x_origin_cookie
+                    print("Retrying search with fresh cookies...")
+                    sid, host, timestamp = start_search(start_payload, current_headers)
+                    print("search_id:", sid)
+                    res = poll_results(sid, host)
+                else:
+                    # Если даже fallback куки не помогли, попробуем без них
+                    print("Fresh cookies failed, trying without x-origin-cookie header...")
+                    if "x-origin-cookie" in current_headers:
+                        del current_headers["x-origin-cookie"]
+                    sid, host, timestamp = start_search(start_payload, current_headers)
+                    print("search_id:", sid)
+                    res = poll_results(sid, host)
+                    
+            except Exception as refresh_error:
+                print(f"Cookie refresh failed: {refresh_error}")
+                # Последняя попытка без кук
+                print("Final attempt without cookies...")
+                if "x-origin-cookie" in current_headers:
+                    del current_headers["x-origin-cookie"]
+                try:
+                    sid, host, timestamp = start_search(start_payload, current_headers)
+                    print("search_id:", sid)
+                    res = poll_results(sid, host)
+                except Exception as final_error:
+                    raise HTTPException(
+                        status_code=503, 
+                        detail=f"All attempts failed. Original error: {e.response.status_code}, Cookie refresh error: {refresh_error}, Final error: {final_error}"
+                    )
         else:
             raise HTTPException(status_code=e.response.status_code, detail=f"HTTP error: {e}")
+            
     except TimeoutError as e:
         raise HTTPException(status_code=408, detail=f"Polling timed out: {e}")
     except Exception as e:
+        print(f"Unexpected error: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
     summary_data = build_summary(res, start_payload)
