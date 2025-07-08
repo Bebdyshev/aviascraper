@@ -25,7 +25,7 @@ HEADERS = {
     "Accept-Language": "ru-RU,en-US;q=0.8,ru;q=0.5,en;q=0.3",
     "Accept-Encoding": "gzip, deflate, br, zstd",
     "x-client-type": "web",
-    "x-aws-waf-token": "a097d6e8-b953-4b4b-8cce-127af45b1048:BQoAfW5++YJGAQAA:VY+FCaJ4N9XAcszXACeEk2H3Dzr+Eq69EnrKQWcveW/hPO/K0gOWlt+lDOvHga3ofG2nAQ2yWyL5hQ4hwwMSZtHcDHQjxOw3ddTFSDdHVCBIqIU58kdYXQBjYsN295oUfxCTr4Jy7jYxtbEuSvSOghx7aSbO4LzY1BnmId8HV22ZItE4iHp/p8vhAPEJdyvWJFYmlVPwN1gow3Dy8WRs0bHASrhWLtC0VcG1XgX/T2tqkOP26LEi7rYHS9BBgF4iIG3NfA==",
+    "x-aws-waf-token": "a097d6e8-b953-4b4b-8cce-127af45b1048:BQoAqroujQTuAQAA:oz5y80n/ElZnbc1DqMtn+U6l/XKbqP4+xIL54Xd7afqh/OGPenNt2+WXHUftFC8OqnRnG5OCBv7U5Wesv0ucesEwC8StUGUR9J6dkgGpLeBNyvEByAqWwDN/LGBHldYZ5jm38flXGACIXnO9RnS5Yz0QlXwWNJOmqTorP74sNiZjXOvWEoU6lOg+LJ99XBvbBxOVnplGQft78prxP2pevLF3BwTvw00nCN5Ssaihw+47VeHa11PNI8UQqrfff/O1RPjMxNoM8EqH",
     "Sec-GPC": "1",
     "Connection": "keep-alive",
     "Sec-Fetch-Dest": "empty",
@@ -290,6 +290,19 @@ def get_x_origin_cookie(force_refresh: bool = False) -> str:
                 print(f"Error closing driver: {e}")
 
 
+def extract_waf_token_from_cookies(cookie_string: str) -> str:
+    """
+    Извлекает aws-waf-token из строки кук
+    """
+    if not cookie_string:
+        return ""
+    
+    for cookie in cookie_string.split("; "):
+        if cookie.startswith("aws-waf-token="):
+            return cookie.split("=", 1)[1]
+    
+    return ""
+
 def get_fallback_cookies() -> str:
     """
     Возвращает заранее подготовленные куки как fallback, 
@@ -505,6 +518,11 @@ async def search_flights(request_data: SearchRequest):
         x_origin_cookie = get_x_origin_cookie()
         if x_origin_cookie:
             current_headers["x-origin-cookie"] = x_origin_cookie
+            # Пытаемся извлечь динамический WAF token из кук
+            waf_token = extract_waf_token_from_cookies(x_origin_cookie)
+            if waf_token:
+                current_headers["x-aws-waf-token"] = waf_token
+                print(f"Using dynamic WAF token: {waf_token[:50]}...")
             print(f"Using cookies: {x_origin_cookie[:100]}..." if len(x_origin_cookie) > 100 else f"Using cookies: {x_origin_cookie}")
         else:
             print("No cookies available, trying without x-origin-cookie header")
@@ -522,6 +540,14 @@ async def search_flights(request_data: SearchRequest):
                 x_origin_cookie = get_x_origin_cookie(force_refresh=True)
                 if x_origin_cookie and x_origin_cookie != "currency=KZT; marker=direct; auid=fallback":
                     current_headers["x-origin-cookie"] = x_origin_cookie
+                    # Обновляем WAF token из новых кук
+                    waf_token = extract_waf_token_from_cookies(x_origin_cookie)
+                    if waf_token:
+                        current_headers["x-aws-waf-token"] = waf_token
+                        print(f"Using fresh WAF token: {waf_token[:50]}...")
+                    elif "x-aws-waf-token" in current_headers:
+                        del current_headers["x-aws-waf-token"]
+                        print("No WAF token in fresh cookies, removing from headers")
                     print("Retrying search with fresh cookies...")
                     sid, host, timestamp = start_search(start_payload, current_headers)
                     print("search_id:", sid)
