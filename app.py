@@ -54,53 +54,6 @@ class SearchRequest(BaseModel):
     market: str = "kz"
     currency: str = "kzt"
 
-
-def build_aviasales_token(ticket: dict) -> str:
-    """
-    Формирует строку для ?t=... по данным билета Aviasales.
-    Ожидает структуру ticket, аналогичную summary (см. build_summary).
-    """
-    def seg_to_str(leg):
-        # Код авиакомпании (2-3 буквы)
-        airline = leg.get("airline_id", "")[:2]
-        # Время вылета/прилета (unix, 10 цифр)
-        dep = str(leg.get("departure_unix_timestamp", 0)).zfill(10)
-        arr = str(leg.get("arrival_unix_timestamp", 0)).zfill(10)
-        # Длительность (в минутах, 8 цифр)
-        duration = int((leg.get("arrival_unix_timestamp", 0) or 0) - (leg.get("departure_unix_timestamp", 0) or 0)) // 60
-        duration_str = str(duration).zfill(8)
-        # Коды аэропортов (3*3=9 символов)
-        oa = leg.get("origin", "XXX")[:3]
-        ma = leg.get("middle", "")[:3]  # middle может отсутствовать
-        da = leg.get("destination", "XXX")[:3]
-        # Если middle отсутствует, берем только oa+da
-        if ma:
-            airports = f"{oa}{ma}{da}"
-        else:
-            airports = f"{oa}{da}"
-        return f"{airline}{dep}{arr}{duration_str}{airports}"
-
-    # Собираем все сегменты (туда + обратно)
-    segs = []
-    for leg in ticket.get("flights_to", []):
-        segs.append(seg_to_str(leg))
-    for leg in ticket.get("flights_return", []):
-        segs.append(seg_to_str(leg))
-    part_a = "".join(segs)
-
-    # Подпись (signature/hash)
-    signature = ticket.get("id")
-
-    # Цена (в копейках/центах/рублях*100)
-    price_val = ticket.get("unified_price", 0)
-    try:
-        price_int = int(round(float(price_val) * 100))
-    except Exception:
-        price_int = 0
-    part_c = str(price_int)
-
-    return f"{part_a}_{signature}_{part_c}"
-
 def build_aviasales_token_v2(ticket: dict) -> str:
     """
     Формирует строку для ?t=... по новому формату:
@@ -153,21 +106,6 @@ def build_aviasales_token_v2(ticket: dict) -> str:
     token = f"{carrier_id}{dep_to}{arr_to}{duration_to_str}{airports_to}{dep_ret}{arr_ret}{duration_ret_str}{airports_ret}_{ticket_id}_{price_rub}"
     return token
 
-def start_search() -> tuple[str, str]:
-    """Initiate Aviasales search and return (search_id, results_host)."""
-    print("Headers:", HEADERS)
-    resp = requests.post(START_URL, headers=HEADERS, json=START_PAYLOAD, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-
-    search_id = data.get("search_id")
-    timestamp = data.get("search_timestamp")
-    assert search_id, "search_id not found in start response"
-
-    results_host = data.get("results_url", "tickets-api.eu-central-1.aviasales.com")
-    return search_id, results_host, timestamp
-
-
 def poll_results(search_id: str, results_host: str, limit: int = 100, max_attempts: int = 10, delay: int = 1) -> dict:
     """Poll the results endpoint until tickets appear or max attempts reached. Делает минимум 3 попытки polling."""
     last_ts = 0
@@ -198,6 +136,8 @@ def poll_results(search_id: str, results_host: str, limit: int = 100, max_attemp
             # Update timestamp if dict contains it
             if isinstance(data, dict):
                 last_ts = data.get("last_update_timestamp", last_ts)
+
+            print("Polling attempt", attempt, "/", max_attempts, "with ts", last_ts)
 
             if len(data[0].get('tickets')) >= 100:
                 return data
@@ -309,11 +249,11 @@ def search_flights(
         resp = requests.post(results_url, headers=headers, json=body, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, list) and len(data) > 0 and data[0].get('tickets'):
+        if isinstance(data, list) and len(data) >= 100 and data[0].get('tickets'):
             break
-        if isinstance(data, dict) and data.get('tickets'):
-            break
-    else:
+        print(f"Polling attempt {attempt}/{10} with ts {last_ts}")
+        time.sleep(1)
+    if not data:
         raise Exception("No ticket data returned within polling attempts")
     return build_summary(data)
 
