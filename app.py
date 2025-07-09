@@ -54,6 +54,151 @@ class SearchRequest(BaseModel):
     market: str = "kz"
     currency: str = "kzt"
 
+# --- Cookie logic ---
+def get_x_origin_cookie(force_refresh: bool = False) -> str:
+    """
+    Gets cookies, from cache if available, or via Playwright if forced/needed.
+    Set force_refresh=True to ignore cache and get new cookies.
+    """
+    def load_cookies_from_file() -> str:
+        try:
+            with open(COOKIES_FILE, "r") as f:
+                cookies = json.load(f)
+            if cookies and isinstance(cookies, list) and len(cookies) > 0:
+                return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        except (json.JSONDecodeError, IOError, KeyError) as e:
+            print(f"Could not read cookie file, will fetch new ones. Error: {e}")
+        return None
+
+    if not force_refresh and os.path.exists(COOKIES_FILE):
+        cookie_str = load_cookies_from_file()
+        if cookie_str:
+            return cookie_str
+        # else: fall through to fetch new cookies
+
+    print("Fetching fresh cookies via Playwright (this might take a moment)...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0",
+        )
+        page = context.new_page()
+        try:
+            page.goto("https://www.aviasales.kz/search/NQZ0108AKX15081", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+            cookies = context.cookies()
+            with open(COOKIES_FILE, "w") as f:
+                json.dump(cookies, f)
+            print("Successfully fetched and cached new cookies.")
+            if cookies and isinstance(cookies, list) and len(cookies) > 0:
+                return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            else:
+                raise RuntimeError("Playwright did not return any cookies!")
+        finally:
+            browser.close()
+    raise RuntimeError("Could not obtain Aviasales cookies (even after Playwright refresh)")
+
+# --- Search logic ---
+def start_search(payload: dict) -> tuple:
+    """
+    Starts the search process by sending a POST request to the Aviasales API.
+    Returns search_id, results_host, and search_timestamp.
+    """
+    x_origin_cookie = get_x_origin_cookie()
+    HEADERS["x-origin-cookie"] = x_origin_cookie
+    resp = requests.post(START_URL, headers=HEADERS, json=payload, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    search_id = data.get("search_id")
+    timestamp = data.get("search_timestamp")
+    if not search_id:
+        raise Exception("search_id not found in start response")
+    results_host = data.get("results_url", "tickets-api.eu-central-1.aviasales.com")
+    return search_id, results_host, timestamp
+
+def poll_results(search_id: str, results_host: str, limit: int = 100, max_attempts: int = 10, delay: int = 1) -> dict:
+    """Poll the results endpoint until tickets appear or max attempts reached. Делает минимум 3 попытки polling."""
+    last_ts = 0
+    body_base = {
+        "limit": limit,
+        "price_per_person": False,
+        "search_by_airport": False,
+        "search_id": search_id,
+    }
+
+    data = None
+    for attempt in range(1, max_attempts + 1):
+        body = {**body_base, "last_update_timestamp": last_ts}
+        headers = HEADERS.copy()
+        headers["x-request-id"] = str(uuid.uuid4())
+        results_url = f"https://{results_host}/search/v3.2/results"
+        print(f"Polling attempt {attempt}/{max_attempts} (ts={last_ts})…")
+        try:
+            resp = requests.post(results_url, headers=headers, json=body, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            # Print minimal progress info
+            if attempt == 1 or attempt % 3 == 0:
+                if isinstance(data, dict):
+                    print("Keys:", list(data.keys())[:10])
+                else:
+                    print(f"Received list with {len(data)} items")
+            # Update timestamp if dict contains it
+            if isinstance(data, dict):
+                last_ts = data.get("last_update_timestamp", last_ts)
+
+            print("Polling attempt", attempt, "/", max_attempts, "with ts", last_ts)
+
+            if len(data[0].get('tickets')) >= 100:
+                return data
+            
+            print(len(data[0].get('tickets')))
+
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"Request error: {e}")
+            raise
+
+    raise TimeoutError("No ticket data returned within polling attempts")
+
+# --- Token helpers ---
+def build_aviasales_token(ticket: dict) -> str:
+    """
+    Формирует строку для ?t=... по старому формату:
+    {carrier_id}{unix_departure}{unix_arrival}{duration6}{airports_to}{unix_departure_return}{unix_arrival_return}{duration6_return}{airports_return}_{ticket_id}_{price_in_rub}
+    carrier_id — последний код авиакомпании из всего маршрута
+    Для unix_departure/unix_arrival брать из signature первого/последнего сегмента (первое/второе число).
+    """
+    def seg_to_str(leg):
+        airline = leg.get("airline_id", "")[:2]
+        dep = str(leg.get("departure_unix_timestamp", 0)).zfill(10)
+        arr = str(leg.get("arrival_unix_timestamp", 0)).zfill(10)
+        duration = int((leg.get("arrival_unix_timestamp", 0) or 0) - (leg.get("departure_unix_timestamp", 0) or 0)) // 60
+        duration_str = str(duration).zfill(8)
+        oa = leg.get("origin", "XXX")[:3]
+        ma = leg.get("middle", "")[:3]
+        da = leg.get("destination", "XXX")[:3]
+        if ma:
+            airports = f"{oa}{ma}{da}"
+        else:
+            airports = f"{oa}{da}"
+        return f"{airline}{dep}{arr}{duration_str}{airports}"
+    segs = []
+    for leg in ticket.get("flights_to", []):
+        segs.append(seg_to_str(leg))
+    for leg in ticket.get("flights_return", []):
+        segs.append(seg_to_str(leg))
+    part_a = "".join(segs)
+    signature = ticket.get("id")
+    price_val = ticket.get("unified_price", 0)
+    try:
+        price_int = int(round(float(price_val) * 100))
+    except Exception:
+        price_int = 0
+    part_c = str(price_int)
+    return f"{part_a}_{signature}_{part_c}"
+
 def build_aviasales_token_v2(ticket: dict) -> str:
     """
     Формирует строку для ?t=... по новому формату:
@@ -106,162 +251,7 @@ def build_aviasales_token_v2(ticket: dict) -> str:
     token = f"{carrier_id}{dep_to}{arr_to}{duration_to_str}{airports_to}{dep_ret}{arr_ret}{duration_ret_str}{airports_ret}_{ticket_id}_{price_rub}"
     return token
 
-def poll_results(search_id: str, results_host: str, limit: int = 100, max_attempts: int = 10, delay: int = 1) -> dict:
-    """Poll the results endpoint until tickets appear or max attempts reached. Делает минимум 3 попытки polling."""
-    last_ts = 0
-    body_base = {
-        "limit": limit,
-        "price_per_person": False,
-        "search_by_airport": False,
-        "search_id": search_id,
-    }
-
-    data = None
-    for attempt in range(1, max_attempts + 1):
-        body = {**body_base, "last_update_timestamp": last_ts}
-        headers = HEADERS.copy()
-        headers["x-request-id"] = str(uuid.uuid4())
-        results_url = f"https://{results_host}/search/v3.2/results"
-        print(f"Polling attempt {attempt}/{max_attempts} (ts={last_ts})…")
-        try:
-            resp = requests.post(results_url, headers=headers, json=body, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            # Print minimal progress info
-            if attempt == 1 or attempt % 3 == 0:
-                if isinstance(data, dict):
-                    print("Keys:", list(data.keys())[:10])
-                else:
-                    print(f"Received list with {len(data)} items")
-            # Update timestamp if dict contains it
-            if isinstance(data, dict):
-                last_ts = data.get("last_update_timestamp", last_ts)
-
-            print("Polling attempt", attempt, "/", max_attempts, "with ts", last_ts)
-
-            if len(data[0].get('tickets')) >= 100:
-                return data
-            
-            print(len(data[0].get('tickets')))
-
-            time.sleep(1)
-
-        except Exception as e:
-            print(f"Request error: {e}")
-            raise
-
-    raise TimeoutError("No ticket data returned within polling attempts")
-
-def get_x_origin_cookie(force_refresh: bool = False) -> str:
-    """
-    Gets cookies, from cache if available, or via Playwright if forced/needed.
-    Set force_refresh=True to ignore cache and get new cookies.
-    """
-    def load_cookies_from_file() -> str:
-        try:
-            with open(COOKIES_FILE, "r") as f:
-                cookies = json.load(f)
-            if cookies and isinstance(cookies, list) and len(cookies) > 0:
-                return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        except (json.JSONDecodeError, IOError, KeyError) as e:
-            print(f"Could not read cookie file, will fetch new ones. Error: {e}")
-        return None
-
-    if not force_refresh and os.path.exists(COOKIES_FILE):
-        cookie_str = load_cookies_from_file()
-        if cookie_str:
-            return cookie_str
-        # else: fall through to fetch new cookies
-
-    print("Fetching fresh cookies via Playwright (this might take a moment)...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0",
-        )
-        page = context.new_page()
-        try:
-            page.goto("https://www.aviasales.kz/search/NQZ0108AKX15081", wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
-            cookies = context.cookies()
-            with open(COOKIES_FILE, "w") as f:
-                json.dump(cookies, f)
-            print("Successfully fetched and cached new cookies.")
-            if cookies and isinstance(cookies, list) and len(cookies) > 0:
-                return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            else:
-                raise RuntimeError("Playwright did not return any cookies!")
-        finally:
-            browser.close()
-    raise RuntimeError("Could not obtain Aviasales cookies (even after Playwright refresh)")
-
-
-def search_flights(
-    directions: List[Dict],
-    passengers: Dict,
-    trip_class: str = "Y",
-    market: str = "kz",
-    currency: str = "kzt"
-) -> dict:
-    payload = {
-        "search_params": {
-            "directions": directions,
-            "passengers": passengers,
-            "trip_class": trip_class,
-        },
-        "client_features": {
-            "direct_flights": True,
-            "brand_ticket": False,
-            "top_filters": True,
-            "badges": False,
-            "tour_tickets": True,
-            "assisted": True,
-        },
-        "market_code": market,
-        "marker": "direct",
-        "citizenship": "KZ",
-        "currency_code": currency,
-        "languages": {"ru": 1, "en": 2},
-        "experiment_groups": {"usc-exp-showSupportLinkNavbar": "enabled"},
-        "debug": {"override_experiment_groups": {}},
-        "brand": "AS",
-    }
-    x_origin_cookie = get_x_origin_cookie()
-    HEADERS["x-origin-cookie"] = x_origin_cookie
-    resp = requests.post(START_URL, headers=HEADERS, json=payload, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    search_id = data.get("search_id")
-    results_host = data.get("results_url", "tickets-api.eu-central-1.aviasales.com")
-    timestamp = data.get("search_timestamp")
-    if not search_id:
-        raise Exception("search_id not found in start response")
-    # Poll results
-    last_ts = 0
-    body_base = {
-        "limit": 100,
-        "price_per_person": False,
-        "search_by_airport": False,
-        "search_id": search_id,
-    }
-    data = None
-    for attempt in range(1, 11):
-        body = {**body_base, "last_update_timestamp": last_ts}
-        headers = HEADERS.copy()
-        headers["x-request-id"] = str(uuid.uuid4())
-        results_url = f"https://{results_host}/search/v3.2/results"
-        resp = requests.post(results_url, headers=headers, json=body, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list) and len(data) >= 100 and data[0].get('tickets'):
-            break
-        print(f"Polling attempt {attempt}/{10} with ts {last_ts}")
-        time.sleep(1)
-    if not data:
-        raise Exception("No ticket data returned within polling attempts")
-    return build_summary(data)
-
-# --- build_summary and build_aviasales_token_v2 (unchanged, but only these two helpers) ---
+# --- Summary builder ---
 def build_summary(api_response):
     if isinstance(api_response, list):
         for chunk in api_response:
@@ -408,17 +398,71 @@ def health():
 @app.post("/search")
 def search(request: SearchRequest):
     try:
-        # Преобразуем directions и passengers в dict для search_flights
         directions = [d.dict() for d in request.directions]
         passengers = request.passengers.dict()
-        result = search_flights(
-            directions=directions,
-            passengers=passengers,
-            trip_class=request.trip_class,
-            market=request.market,
-            currency=request.currency,
-        )
-        return JSONResponse(content=result)
+        payload = {
+            "search_params": {
+                "directions": directions,
+                "passengers": passengers,
+                "trip_class": request.trip_class,
+            },
+            "client_features": {
+                "direct_flights": True,
+                "brand_ticket": False,
+                "top_filters": True,
+                "badges": False,
+                "tour_tickets": True,
+                "assisted": True,
+            },
+            "market_code": request.market,
+            "marker": "direct",
+            "citizenship": "KZ",
+            "currency_code": request.currency,
+            "languages": {"ru": 1, "en": 2},
+            "experiment_groups": {"usc-exp-showSupportLinkNavbar": "enabled"},
+            "debug": {"override_experiment_groups": {}},
+            "brand": "AS",
+        }
+        HEADERS["x-origin-cookie"] = get_x_origin_cookie()
+        search_id, results_host, timestamp = start_search(payload)
+        raw_data = poll_results(search_id, results_host)
+        summary = build_summary(raw_data)
+        return JSONResponse(content=summary)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/raw")
+def raw(request: SearchRequest):
+    try:
+        directions = [d.dict() for d in request.directions]
+        passengers = request.passengers.dict()
+        payload = {
+            "search_params": {
+                "directions": directions,
+                "passengers": passengers,
+                "trip_class": request.trip_class,
+            },
+            "client_features": {
+                "direct_flights": True,
+                "brand_ticket": False,
+                "top_filters": True,
+                "badges": False,
+                "tour_tickets": True,
+                "assisted": True,
+            },
+            "market_code": request.market,
+            "marker": "direct",
+            "citizenship": "KZ",
+            "currency_code": request.currency,
+            "languages": {"ru": 1, "en": 2},
+            "experiment_groups": {"usc-exp-showSupportLinkNavbar": "enabled"},
+            "debug": {"override_experiment_groups": {}},
+            "brand": "AS",
+        }
+        HEADERS["x-origin-cookie"] = get_x_origin_cookie()
+        search_id, results_host, timestamp = start_search(payload)
+        raw_data = poll_results(search_id, results_host)
+        return JSONResponse(content=raw_data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
  
