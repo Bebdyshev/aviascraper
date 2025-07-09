@@ -2,11 +2,14 @@ import requests
 import time
 import uuid
 import json
+import asyncio
 import os
 from playwright.sync_api import sync_playwright
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Optional
 
 COOKIES_FILE = "aviasales_cookies.json"
 START_URL = "https://tickets-api.aviasales.com/search/v2/start"
@@ -21,8 +24,8 @@ HEADERS = {
     "Referer": "https://www.aviasales.kz/",
     "Accept-Language": "ru-RU,en-US;q=0.8,ru;q=0.5,en;q=0.3",
     "Accept-Encoding": "gzip, deflate, br, zstd",
+    "x-aws-waf-token": "7874dc40-5cb5-4347-822c-1ce3dc95ca71:BQoAmQZaidMZAQAA:od89IbdichDHnJ18ltcbmAaTeue8ydwvG787yU9iHWf3DMme8fhGpLQfBIsLb0vJhqiuRdDs05OgocMiscy14xWV9nsxsI2qwKYTBJOyP6M1mDynphNiQrEQPxJTOzNusVJ1F8elJ2/GNqCnrWNbgSsRsvTz7bB/R6g8fCcmYXRKJJGAEm98jvOn3UmzLYiuq82VAh+JOJyB9NHYUwK1mNvwr/6hehjmYXrZkdz5k9Z9wrj2VBMWWEnVtOCj19b8XT9wdEu00q6E",
     "x-client-type": "web",
-    "x-aws-waf-token": "a097d6e8-b953-4b4b-8cce-127af45b1048:BQoAqroujQTuAQAA:oz5y80n/ElZnbc1DqMtn+U6l/XKbqP4+xIL54Xd7afqh/OGPenNt2+WXHUftFC8OqnRnG5OCBv7U5Wesv0ucesEwC8StUGUR9J6dkgGpLeBNyvEByAqWwDN/LGBHldYZ5jm38flXGACIXnO9RnS5Yz0QlXwWNJOmqTorP74sNiZjXOvWEoU6lOg+LJ99XBvbBxOVnplGQft78prxP2pevLF3BwTvw00nCN5Ssaihw+47VeHa11PNI8UQqrfff/O1RPjMxNoM8EqH",
     "Sec-GPC": "1",
     "Connection": "keep-alive",
     "Sec-Fetch-Dest": "empty",
@@ -32,14 +35,15 @@ HEADERS = {
     "TE": "trailers"
 }
 
-# --- Pydantic Models for FastAPI ---
+app = FastAPI()
+
 class Direction(BaseModel):
     origin: str
     destination: str
-    date: str
+    date: str  # YYYY-MM-DD
 
 class Passengers(BaseModel):
-    adults: int
+    adults: int = 1
     children: int = 0
     infants: int = 0
 
@@ -50,7 +54,6 @@ class SearchRequest(BaseModel):
     market: str = "kz"
     currency: str = "kzt"
 
-app = FastAPI()
 
 def build_aviasales_token(ticket: dict) -> str:
     """
@@ -150,10 +153,10 @@ def build_aviasales_token_v2(ticket: dict) -> str:
     token = f"{carrier_id}{dep_to}{arr_to}{duration_to_str}{airports_to}{dep_ret}{arr_ret}{duration_ret_str}{airports_ret}_{ticket_id}_{price_rub}"
     return token
 
-def start_search(payload: dict, headers: dict) -> tuple[str, str, str]:
+def start_search() -> tuple[str, str]:
     """Initiate Aviasales search and return (search_id, results_host)."""
-    print("Headers:", headers)
-    resp = requests.post(START_URL, headers=headers, json=payload, timeout=15)
+    print("Headers:", HEADERS)
+    resp = requests.post(START_URL, headers=HEADERS, json=START_PAYLOAD, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -209,7 +212,6 @@ def poll_results(search_id: str, results_host: str, limit: int = 100, max_attemp
 
     raise TimeoutError("No ticket data returned within polling attempts")
 
-
 def get_x_origin_cookie(force_refresh: bool = False) -> str:
     """
     Gets cookies, from cache if available, or via Playwright if forced/needed.
@@ -228,124 +230,109 @@ def get_x_origin_cookie(force_refresh: bool = False) -> str:
             # Fall through to fetch new cookies
 
     print("Fetching fresh cookies via Playwright (this might take a moment)...")
-    
-    try:
-        with sync_playwright() as p:
-            print("Starting browser...")
-            # Запускаем Chromium в headless режиме
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage", 
-                    "--disable-gpu",
-                    "--disable-web-security",
-                    "--disable-features=VizDisplayCompositor"
-                ]
-            )
-            
-            print("Creating browser context...")
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0",
-                viewport={"width": 1920, "height": 1080}
-            )
-            
-            print("Opening new page...")
-            page = context.new_page()
-            
-            print("Navigating to Aviasales...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0",
+        )
+        page = context.new_page()
+        try:
             # Go to a search page to ensure all necessary cookies are set
-            page.goto("https://www.aviasales.kz/search/NQZ0108AKX15081", wait_until="networkidle")
-            
-            # Small wait for JS to set cookies
+            page.goto("https://www.aviasales.kz/search/NQZ0108AKX15081", wait_until="domcontentloaded", timeout=30000)
+            # A small wait can help with cookies set by JS after load
             page.wait_for_timeout(3000)
 
-            print("Extracting cookies...")
-            cookies_playwright = context.cookies()
-            
-            print(f"Found {len(cookies_playwright)} cookies")
-            if not cookies_playwright:
-                raise Exception("No cookies found")
-            
-            # Преобразуем формат кук из Playwright в формат Selenium для совместимости
-            cookies_selenium_format = []
-            for cookie in cookies_playwright:
-                cookies_selenium_format.append({
-                    "name": cookie["name"],
-                    "value": cookie["value"],
-                    "domain": cookie["domain"],
-                    "path": cookie["path"],
-                    "secure": cookie["secure"],
-                    "httpOnly": cookie["httpOnly"]
-                })
-            
+            cookies = context.cookies()
             with open(COOKIES_FILE, "w") as f:
-                json.dump(cookies_selenium_format, f)
+                json.dump(cookies, f)
             print("Successfully fetched and cached new cookies.")
 
+            return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        finally:
             browser.close()
-            return "; ".join([f"{c['name']}={c['value']}" for c in cookies_selenium_format])
-        
-    except Exception as e:
-        error_msg = f"Playwright failed: {type(e).__name__}: {str(e)}"
-        print(f"ERROR: {error_msg}")
-        
-        # Fallback: попробуем использовать статические куки или вернуть пустую строку
-        print("Trying fallback approach...")
-        fallback_cookies = get_fallback_cookies()
-        if fallback_cookies:
-            print("Using fallback cookies")
-            return fallback_cookies
-        else:
-            print("No fallback cookies available")
-            # Возвращаем пустую строку вместо краха приложения
-            return ""
 
 
-def extract_waf_token_from_cookies(cookie_string: str) -> str:
-    """
-    Извлекает aws-waf-token из строки кук
-    """
-    if not cookie_string:
-        return ""
-    
-    for cookie in cookie_string.split("; "):
-        if cookie.startswith("aws-waf-token="):
-            return cookie.split("=", 1)[1]
-    
-    return ""
+def search_flights(
+    directions: List[Dict],
+    passengers: Dict,
+    trip_class: str = "Y",
+    market: str = "kz",
+    currency: str = "kzt"
+) -> dict:
+    payload = {
+        "search_params": {
+            "directions": directions,
+            "passengers": passengers,
+            "trip_class": trip_class,
+        },
+        "client_features": {
+            "direct_flights": True,
+            "brand_ticket": False,
+            "top_filters": True,
+            "badges": False,
+            "tour_tickets": True,
+            "assisted": True,
+        },
+        "market_code": market,
+        "marker": "direct",
+        "citizenship": "KZ",
+        "currency_code": currency,
+        "languages": {"ru": 1, "en": 2},
+        "experiment_groups": {"usc-exp-showSupportLinkNavbar": "enabled"},
+        "debug": {"override_experiment_groups": {}},
+        "brand": "AS",
+    }
+    x_origin_cookie = get_x_origin_cookie()
+    HEADERS["x-origin-cookie"] = x_origin_cookie
+    resp = requests.post(START_URL, headers=HEADERS, json=payload, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    search_id = data.get("search_id")
+    results_host = data.get("results_url", "tickets-api.eu-central-1.aviasales.com")
+    timestamp = data.get("search_timestamp")
+    if not search_id:
+        raise Exception("search_id not found in start response")
+    # Poll results
+    last_ts = 0
+    body_base = {
+        "limit": 100,
+        "price_per_person": False,
+        "search_by_airport": False,
+        "search_id": search_id,
+    }
+    data = None
+    for attempt in range(1, 11):
+        body = {**body_base, "last_update_timestamp": last_ts}
+        headers = HEADERS.copy()
+        headers["x-request-id"] = str(uuid.uuid4())
+        results_url = f"https://{results_host}/search/v3.2/results"
+        resp = requests.post(results_url, headers=headers, json=body, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and len(data) > 0 and data[0].get('tickets'):
+            break
+        if isinstance(data, dict) and data.get('tickets'):
+            break
+    else:
+        raise Exception("No ticket data returned within polling attempts")
+    return build_summary(data)
 
-def get_fallback_cookies() -> str:
-    """
-    Возвращает заранее подготовленные куки как fallback, 
-    если Selenium не работает на сервере
-    """
-    # Можно вручную добавить некоторые базовые куки
-    # Это не идеальное решение, но лучше чем полный крах
-    fallback = "currency=KZT; marker=direct; auid=fallback"
-    return fallback
-
-def build_summary(api_response, start_payload):
-    # If response is list of chunks, find the one with chunk_id == "results"
+# --- build_summary and build_aviasales_token_v2 (unchanged, but only these two helpers) ---
+def build_summary(api_response):
     if isinstance(api_response, list):
         for chunk in api_response:
             if isinstance(chunk, dict) and chunk.get("chunk_id") == "results":
                 api_response = chunk
                 break
-
     if not isinstance(api_response, dict):
         return []
-
     summary_tickets = []
     flight_legs = api_response.get("flight_legs", [])
     if not isinstance(flight_legs, list):
         return summary_tickets
-
     places = api_response.get("places", {})
     cities = places.get("cities", {})
     countries = places.get("countries", {})
-
-    # Build airport->city name mapping
     airports_dict = places.get("airports", {})
     airport_to_city_ru = {}
     airport_to_city_en = {}
@@ -358,10 +345,8 @@ def build_summary(api_response, start_payload):
                 airport_to_city_ru[a_code] = city_name_ru
             if city_name_en:
                 airport_to_city_en[a_code] = city_name_en
-
     def zero_pad(val, width=8):
         return str(val).zfill(width)
-
     def get_signature_times(leg):
         sig = leg.get("signature")
         if sig and ":" in sig:
@@ -371,12 +356,10 @@ def build_summary(api_response, start_payload):
                     return int(parts[0]), int(parts[1])
                 except Exception:
                     pass
-        # fallback
         return (
             int(leg.get("departure_unix_timestamp", 0)),
             int(leg.get("arrival_unix_timestamp", 0)),
         )
-
     for ticket in api_response.get("tickets", []):
         item = {
             "id": ticket.get("id"),
@@ -384,7 +367,6 @@ def build_summary(api_response, start_payload):
             "flights_to": [],
             "flights_return": []
         }
-        # Новые поля summary
         item["ticket_id"] = ticket.get("id")
         price_val = item["price"].get("value", 0)
         item["unified_price"] = int(round(float(price_val) * 100))
@@ -402,7 +384,7 @@ def build_summary(api_response, start_payload):
         for seg_idx, segment in enumerate(segments):
             for idx in segment.get("flights", []):
                 if 0 <= idx < len(flight_legs):
-                    leg = dict(flight_legs[idx])  # copy
+                    leg = dict(flight_legs[idx])
                     oa = leg.get("origin")
                     da = leg.get("destination")
                     leg["origin_city_ru"] = airport_to_city_ru.get(oa, oa)
@@ -414,7 +396,6 @@ def build_summary(api_response, start_payload):
                     unix_dep = leg.get("departure_unix_timestamp")
                     unix_arr = leg.get("arrival_unix_timestamp")
                     airports_ids = (oa, da)
-                    # duration по signature
                     sig_dep, sig_arr = get_signature_times(leg)
                     duration = (sig_arr - sig_dep) // 60 if sig_dep and sig_arr else 0
                     if seg_idx == 0:
@@ -431,13 +412,11 @@ def build_summary(api_response, start_payload):
                         flights_return_airline_id.append(carrier_code)
                         flights_return_airports.append(airports_ids)
                         duration_return += duration
-        # Determine route names based on first outbound and last return
         first_leg = item["flights_to"][0] if item["flights_to"] else None
         last_leg = item["flights_return"][-1] if item["flights_return"] else None
         if first_leg and last_leg:
             item["route_ru"] = f"{first_leg['origin_city_ru']} → {last_leg['destination_city_ru']}"
             item["route_en"] = f"{first_leg['origin_city_en']} → {last_leg['destination_city_en']}"
-        # Новые поля
         item["flights_to_unix_departure"] = flights_to_unix_departure
         item["flights_to_unix_arrival"] = flights_to_unix_arrival
         item["flights_to_airline_id"] = flights_to_airline_id
@@ -448,17 +427,12 @@ def build_summary(api_response, start_payload):
         item["flights_return_airline_id"] = flights_return_airline_id
         item["flights_return_airports"] = flights_return_airports
         item["duration_return"] = zero_pad(duration_return, 8)
-        summary_tickets.append(item)
-
-        # Формируем ссылку Aviasales
         def get_url():
-            # origin, dest, dates из start_payload или legs
             try:
-                origin = start_payload["search_params"]["directions"][0]["origin"]
-                dest = start_payload["search_params"]["directions"][0]["destination"]
-                # Преобразуем YYYY-MM-DD -> DDMM
-                date_departure_full = start_payload["search_params"]["directions"][0]["date"]
-                date_return_full = start_payload["search_params"]["directions"][1]["date"]
+                origin = item["flights_to"][0]["origin"] if item["flights_to"] else "XXX"
+                dest = item["flights_to"][-1]["destination"] if item["flights_to"] else "XXX"
+                date_departure_full = item["flights_to"][0]["departure_date"] if item["flights_to"] else "2025-07-09"
+                date_return_full = item["flights_return"][0]["departure_date"] if item["flights_return"] else "2025-07-17"
                 date_departure = date_departure_full[8:10] + date_departure_full[5:7]
                 date_return = date_return_full[8:10] + date_return_full[5:7]
                 passengers = f"1"
@@ -467,14 +441,12 @@ def build_summary(api_response, start_payload):
             token = build_aviasales_token_v2(item)
             return f"https://www.aviasales.kz/search/{origin}{date_departure}{dest}{date_return}{passengers}?t={token}"
         item["aviasales_url"] = get_url()
-
-    # Determine cheapest ticket
+        summary_tickets.append(item)
     cheapest = None
     for t in summary_tickets:
         price_val = t.get("price", {}).get("value", float("inf"))
         if cheapest is None or price_val < cheapest.get("price", {}).get("value", float("inf")):
             cheapest = t
-
     return {
         "cheapest_ticket": cheapest,
         "tickets": summary_tickets,
@@ -484,127 +456,25 @@ def build_summary(api_response, start_payload):
         "countries": countries,
     }
 
+
 @app.get("/health")
-async def health_check():
+def health():
     return {"status": "ok"}
 
 @app.post("/search")
-async def search_flights(request_data: SearchRequest):
-    start_payload = {
-        "search_params": {
-            "directions": [
-                {
-                    "origin": d.origin,
-                    "destination": d.destination,
-                    "date": d.date,
-                    "is_origin_airport": False,
-                    "is_destination_airport": False,
-                }
-                for d in request_data.directions
-            ],
-            "passengers": request_data.passengers.dict(),
-            "trip_class": request_data.trip_class,
-        },
-        "client_features": {
-            "direct_flights": True,
-            "brand_ticket": False,
-            "top_filters": True,
-            "badges": False,
-            "tour_tickets": True,
-            "assisted": True,
-        },
-        "market_code": request_data.market,
-        "marker": "direct",
-        "citizenship": "KZ",
-        "currency_code": request_data.currency,
-        "languages": {"ru": 1, "en": 2},
-        "experiment_groups": {"usc-exp-showSupportLinkNavbar": "enabled"},
-        "debug": {"override_experiment_groups": {}},
-        "brand": "AS",
-    }
-
-    current_headers = HEADERS.copy()
-    
+def search(request: SearchRequest):
     try:
-        print("Getting cookies...")
-        x_origin_cookie = get_x_origin_cookie()
-        if x_origin_cookie:
-            current_headers["x-origin-cookie"] = x_origin_cookie
-            # Пытаемся извлечь динамический WAF token из кук
-            waf_token = extract_waf_token_from_cookies(x_origin_cookie)
-            if waf_token:
-                current_headers["x-aws-waf-token"] = waf_token
-                print(f"Using dynamic WAF token: {waf_token[:50]}...")
-            print(f"Using cookies: {x_origin_cookie[:100]}..." if len(x_origin_cookie) > 100 else f"Using cookies: {x_origin_cookie}")
-        else:
-            print("No cookies available, trying without x-origin-cookie header")
-
-        print("Starting search with current cookies...")
-        sid, host, timestamp = start_search(start_payload, current_headers)
-        print("search_id:", sid)
-        res = poll_results(sid, host)
-        
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code in [401, 403]:
-            print(f"Request failed with {e.response.status_code}. Trying to refresh cookies...")
-            
-            try:
-                x_origin_cookie = get_x_origin_cookie(force_refresh=True)
-                if x_origin_cookie and x_origin_cookie != "currency=KZT; marker=direct; auid=fallback":
-                    current_headers["x-origin-cookie"] = x_origin_cookie
-                    # Обновляем WAF token из новых кук
-                    waf_token = extract_waf_token_from_cookies(x_origin_cookie)
-                    if waf_token:
-                        current_headers["x-aws-waf-token"] = waf_token
-                        print(f"Using fresh WAF token: {waf_token[:50]}...")
-                    elif "x-aws-waf-token" in current_headers:
-                        del current_headers["x-aws-waf-token"]
-                        print("No WAF token in fresh cookies, removing from headers")
-                    print("Retrying search with fresh cookies...")
-                    sid, host, timestamp = start_search(start_payload, current_headers)
-                    print("search_id:", sid)
-                    res = poll_results(sid, host)
-                else:
-                    # Если даже fallback куки не помогли, попробуем без них
-                    print("Fresh cookies failed, trying without x-origin-cookie header...")
-                    if "x-origin-cookie" in current_headers:
-                        del current_headers["x-origin-cookie"]
-                    sid, host, timestamp = start_search(start_payload, current_headers)
-                    print("search_id:", sid)
-                    res = poll_results(sid, host)
-                    
-            except Exception as refresh_error:
-                print(f"Cookie refresh failed: {refresh_error}")
-                # Последняя попытка без кук
-                print("Final attempt without cookies...")
-                if "x-origin-cookie" in current_headers:
-                    del current_headers["x-origin-cookie"]
-                try:
-                    sid, host, timestamp = start_search(start_payload, current_headers)
-                    print("search_id:", sid)
-                    res = poll_results(sid, host)
-                except Exception as final_error:
-                    raise HTTPException(
-                        status_code=503, 
-                        detail=f"All attempts failed. Original error: {e.response.status_code}, Cookie refresh error: {refresh_error}, Final error: {final_error}"
-                    )
-        else:
-            raise HTTPException(status_code=e.response.status_code, detail=f"HTTP error: {e}")
-            
-    except TimeoutError as e:
-        raise HTTPException(status_code=408, detail=f"Polling timed out: {e}")
+        # Преобразуем directions и passengers в dict для search_flights
+        directions = [d.dict() for d in request.directions]
+        passengers = request.passengers.dict()
+        result = search_flights(
+            directions=directions,
+            passengers=passengers,
+            trip_class=request.trip_class,
+            market=request.market,
+            currency=request.currency,
+        )
+        return JSONResponse(content=result)
     except Exception as e:
-        print(f"Unexpected error: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
-
-    summary_data = build_summary(res, start_payload)
-
-    # Optionally save results to files
-    # with open("aviasales_raw.json", "w", encoding="utf-8") as f:
-    #     json.dump(res, f, ensure_ascii=False, indent=2)
-    # summary_file = f"aviasales_summary.json"
-    # with open(summary_file, "w", encoding="utf-8") as f:
-    #     json.dump(summary_data, f, ensure_ascii=False, indent=2)
-
-    return summary_data
+        raise HTTPException(status_code=500, detail=str(e))
  
