@@ -157,17 +157,21 @@ def get_x_origin_cookie(force_refresh: bool = False) -> str:
     Gets cookies, from cache if available, or via Playwright if forced/needed.
     Set force_refresh=True to ignore cache and get new cookies.
     """
-    if not force_refresh and os.path.exists(COOKIES_FILE):
-        print("Loading cookies from cache...")
+    def load_cookies_from_file() -> str:
         try:
             with open(COOKIES_FILE, "r") as f:
                 cookies = json.load(f)
-            # Basic validation to ensure file is not empty/corrupt
-            if cookies and isinstance(cookies, list):
+            if cookies and isinstance(cookies, list) and len(cookies) > 0:
                 return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Could not read cookie file, fetching new ones. Error: {e}")
-            # Fall through to fetch new cookies
+        except (json.JSONDecodeError, IOError, KeyError) as e:
+            print(f"Could not read cookie file, will fetch new ones. Error: {e}")
+        return None
+
+    if not force_refresh and os.path.exists(COOKIES_FILE):
+        cookie_str = load_cookies_from_file()
+        if cookie_str:
+            return cookie_str
+        # else: fall through to fetch new cookies
 
     print("Fetching fresh cookies via Playwright (this might take a moment)...")
     with sync_playwright() as p:
@@ -177,19 +181,19 @@ def get_x_origin_cookie(force_refresh: bool = False) -> str:
         )
         page = context.new_page()
         try:
-            # Go to a search page to ensure all necessary cookies are set
             page.goto("https://www.aviasales.kz/search/NQZ0108AKX15081", wait_until="domcontentloaded", timeout=30000)
-            # A small wait can help with cookies set by JS after load
             page.wait_for_timeout(3000)
-
             cookies = context.cookies()
             with open(COOKIES_FILE, "w") as f:
                 json.dump(cookies, f)
             print("Successfully fetched and cached new cookies.")
-
-            return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            if cookies and isinstance(cookies, list) and len(cookies) > 0:
+                return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            else:
+                raise RuntimeError("Playwright did not return any cookies!")
         finally:
             browser.close()
+    raise RuntimeError("Could not obtain Aviasales cookies (even after Playwright refresh)")
 
 
 def search_flights(
